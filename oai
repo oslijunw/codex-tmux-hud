@@ -117,7 +117,8 @@ def main(args):
         return
     if args[:1] == ["--hud-pane"]:
         footer = "#(" + shlex.quote(SELF) + " --hud-meter tmux-#{pane_id} #{pane_pid}) "
-        for key, value in [("mouse", "on"), ("status-right", footer), ("status-interval", "2"),
+        for key, value in [("set-titles-string", "#{pane_title}"), ("set-titles", "on"),
+                           ("mouse", "on"), ("status-right", footer), ("status-interval", "2"),
                            ("status-right-length", "150"), ("status-style", "bg=colour235,fg=colour252")]:
             subprocess.run(["tmux", "set-option", "-t", os.environ["TMUX_PANE"], key, value], check=True)
         os.execv(sys.executable, [sys.executable, str(APP), "run", "--", *args[1:]])
