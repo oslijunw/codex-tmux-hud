@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from urllib.error import URLError
+from urllib.request import urlopen
+from pathlib import Path
+
+APP = Path(os.environ.get("OAI_COLLECTOR_APP", Path(__file__).resolve().parent / "collector/app.py")).expanduser()
+SELF = str(Path(__file__).resolve())
+
+
+def ensure_receiver():
+    sys.path.insert(0, str(APP.resolve().parent))
+    from app import installed_url
+
+    url = installed_url()
+    def ready():
+        try:
+            with urlopen(url + "/api/health", timeout=0.5) as response:
+                return isinstance(json.load(response), dict)
+        except (OSError, URLError, ValueError):
+            return False
+
+    if ready():
+        return
+    subprocess.Popen([sys.executable, APP, "serve", "--port", url.rsplit(":", 1)[1]],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(30):
+        time.sleep(0.1)
+        if ready():
+            return
+    sys.exit(f"CodexTPS could not start at {url}. Run: python3 '{APP}' serve")
+
+
+def meter(line, context):
+    match = re.search(r"^(.+?) · 最近 ([\d.]+|—) t/s \(([^)]+)\) · 1h ([\d.]+|—)", line)
+    if not match:
+        status = "TPS offline" if line.strip() == "TPS offline" else "Waiting for TPS data"
+        return f"{context} │ {status}"
+    model, speed, age, average = match.groups()
+    age = age.removesuffix("前") + " ago"
+    return f"{model} │ {context} │ {speed} t/s · {age} │ 1h avg {average}"
+
+
+def hit_rate(usage):
+    total = usage.get("input_tokens")
+    hits = usage.get("cached_input_tokens")
+    if isinstance(total, int) and total > 0 and isinstance(hits, int) and 0 <= hits <= total:
+        return f"{100 * hits / total:.1f}%"
+    return "—"
+
+
+def pane_usage(pane_pid):
+    processes = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
+    children = {}
+    for line in processes.splitlines():
+        pid, parent = line.split()
+        children.setdefault(parent, []).append(pid)
+    pids = [pane_pid]
+    for pid in pids:
+        pids.extend(children.get(pid, []))
+    files = subprocess.run(["/usr/sbin/lsof", "-nP", "-Fn", "-p", ",".join(pids)],
+                           capture_output=True, text=True).stdout
+    paths = {Path(line[1:]) for line in files.splitlines()
+             if line.startswith("n/") and "/rollout-" in line and line.endswith(".jsonl")}
+    if len(paths) != 1:
+        return {}
+    with paths.pop().open("rb") as stream:
+        stream.seek(0, 2)
+        end = stream.tell()
+        tail = b""
+        while end:
+            start = max(0, end - 65536)
+            stream.seek(start)
+            lines = (stream.read(end - start) + tail).split(b"\n")
+            tail = lines.pop(0) if start else b""
+            for line in reversed(lines):
+                if b'"token_count"' not in line:
+                    continue
+                try:
+                    payload = json.loads(line)["payload"]
+                    if payload.get("type") != "token_count":
+                        continue
+                    if isinstance(payload.get("info"), dict):
+                        return payload["info"]
+                except (ValueError, TypeError, KeyError):
+                    continue
+            end = start
+    return {}
+
+
+def main(args):
+    if args[:1] == ["--hud-meter"]:
+        result = subprocess.run([sys.executable, APP, "status", "--view", args[1]],
+                                capture_output=True, text=True)
+        try:
+            info = pane_usage(args[2])
+        except (OSError, subprocess.SubprocessError):
+            info = {}
+        last = info.get("last_token_usage") or {}
+        used = last.get("total_tokens")
+        limit = info.get("model_context_window")
+        context = "Context —"
+        if isinstance(used, int) and used >= 0 and isinstance(limit, int) and limit > 0:
+            blocks = min(8, round(8 * used / limit))
+            bar = "▰" * blocks + "▱" * (8 - blocks)
+            context = f"Context {bar} {used / 1000:.1f}k/{limit / 1000:g}k"
+        speed = meter(result.stdout if result.returncode == 0 else "TPS offline", context)
+        session = hit_rate(info.get("total_token_usage") or {})
+        print(f"{speed} │ Cache hit: latest {hit_rate(last)} · session {session}")
+        return
+    if args[:1] == ["--hud-pane"]:
+        footer = "#(" + shlex.quote(SELF) + " --hud-meter tmux-#{pane_id} #{pane_pid}) "
+        for key, value in [("mouse", "on"), ("status-right", footer), ("status-interval", "2"),
+                           ("status-right-length", "150"), ("status-style", "bg=colour235,fg=colour252")]:
+            subprocess.run(["tmux", "set-option", "-t", os.environ["TMUX_PANE"], key, value], check=True)
+        os.execv(sys.executable, [sys.executable, str(APP), "run", "--", *args[1:]])
+    if not APP.is_file():
+        sys.exit(f"Missing CodexTPS entry point: {APP}")
+    ensure_receiver()
+    command = ["tmux", "new-session", "-c", os.getcwd()]
+    pane = [SELF, "--hud-pane", *args]
+    if os.environ.get("TMUX"):
+        session = subprocess.check_output(command + ["-dP", "-F", "#{session_id}", *pane], text=True).strip()
+        os.execlp("tmux", "tmux", "switch-client", "-t", session)
+    os.execvp("tmux", command + pane)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
