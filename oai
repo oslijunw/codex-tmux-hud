@@ -65,10 +65,25 @@ def pane_usage(pane_pid):
     pids = [pane_pid]
     for pid in pids:
         pids.extend(children.get(pid, []))
-    files = subprocess.run(["/usr/sbin/lsof", "-nP", "-Fn", "-p", ",".join(pids)],
-                           capture_output=True, text=True).stdout
-    paths = {Path(line[1:]) for line in files.splitlines()
-             if line.startswith("n/") and "/rollout-" in line and line.endswith(".jsonl")}
+    if sys.platform.startswith("linux"):
+        paths = set()
+        for pid in pids:
+            try:
+                descriptors = list(Path("/proc", pid, "fd").iterdir())
+            except OSError:
+                continue
+            for descriptor in descriptors:
+                try:
+                    target = Path(os.readlink(descriptor))
+                except OSError:
+                    continue
+                if target.name.startswith("rollout-") and target.suffix == ".jsonl":
+                    paths.add(target)
+    else:
+        files = subprocess.run(["/usr/sbin/lsof", "-nP", "-Fn", "-p", ",".join(pids)],
+                               capture_output=True, text=True).stdout
+        paths = {Path(line[1:]) for line in files.splitlines()
+                 if line.startswith("n/") and "/rollout-" in line and line.endswith(".jsonl")}
     if len(paths) != 1:
         return {}
     with paths.pop().open("rb") as stream:
