@@ -36,6 +36,8 @@ Linux requires tmux, Python 3.9+, ps (procps), and access to the current user's 
 
 Context shows the last reported request size and the model context window. Cache hit is cached input tokens divided by all input tokens, shown for the latest request and the cumulative session. Unavailable usage appears as a dash. The launcher identifies the pane's open Codex rollout with macOS lsof or Linux /proc. Speed comes from CodexTPS and the hourly average is for the displayed model.
 
+Click **[Threads]** in the footer to inspect context usage and cache hit rates for the main thread and its open subagents. Press **q** or **Esc** to close the popup. The footer shows main-thread usage when several rollout files are open.
+
 Each launch creates a tmux session with mouse scrolling. Detaching leaves Codex running. Reattach with `tmux attach -t SESSION` to return to it.
 
 ## Collector

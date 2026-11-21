@@ -56,7 +56,7 @@ def hit_rate(usage):
     return "—"
 
 
-def pane_usage(pane_pid):
+def pane_paths(pane_pid):
     processes = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
     children = {}
     for line in processes.splitlines():
@@ -84,9 +84,32 @@ def pane_usage(pane_pid):
                                capture_output=True, text=True).stdout
         paths = {Path(line[1:]) for line in files.splitlines()
                  if line.startswith("n/") and "/rollout-" in line and line.endswith(".jsonl")}
-    if len(paths) != 1:
-        return {}
-    with paths.pop().open("rb") as stream:
+    return paths
+
+
+def metadata(path):
+    with path.open("rb") as stream:
+        record = json.loads(stream.readline())
+    return record["payload"] if record.get("type") == "session_meta" else {}
+
+
+def pane_usage(pane_pid):
+    paths = pane_paths(pane_pid)
+    if len(paths) > 1:
+        roots = set()
+        for path in paths:
+            try:
+                meta = metadata(path)
+                if meta.get("thread_source") == "user" or meta.get("source") == "cli":
+                    roots.add(path)
+            except (OSError, ValueError, KeyError):
+                continue
+        paths = roots
+    return read_usage(paths.pop()) if len(paths) == 1 else {}
+
+
+def read_usage(path):
+    with path.open("rb") as stream:
         stream.seek(0, 2)
         end = stream.tell()
         tail = b""
@@ -110,7 +133,83 @@ def pane_usage(pane_pid):
     return {}
 
 
+def thread_summary(pane_pid):
+    rows = []
+    for path in pane_paths(pane_pid):
+        try:
+            meta = metadata(path)
+            usage = read_usage(path)
+        except (OSError, ValueError, KeyError):
+            continue
+        source = meta.get("source")
+        spawn = source.get("subagent", {}) if isinstance(source, dict) else {}
+        details = spawn.get("thread_spawn", {}) if isinstance(spawn, dict) else {}
+        child = meta.get("thread_source") == "subagent" or bool(spawn)
+        name = meta.get("agent_nickname") or details.get("agent_nickname") or ("Agent" if child else "Main")
+        role = details.get("agent_path") or meta.get("cwd", "").split("/")[-1]
+        label = "".join(c for c in f"{name} ({role})" if c.isprintable())
+        last = usage.get("last_token_usage") or {}
+        used, limit = last.get("total_tokens"), usage.get("model_context_window")
+        context = f"{used/1000:.1f}k/{limit/1000:g}k" if used is not None and limit else "—"
+        rows.append((child, label, context, hit_rate(last), hit_rate(usage.get("total_token_usage") or {})))
+    lines = [f"{'Thread':32}  {'Context':18}  {'Latest hit':>10}  {'Session hit':>11}"]
+    for _, label, context, latest, total in sorted(rows):
+        lines.append(f"{label[:32]:32}  {context:18}  {latest:>10}  {total:>11}")
+    return "\n".join(lines) if rows else "Waiting for thread data"
+
+
+def show_threads(screen, pane_pid):
+    import curses
+    try:
+        rows = thread_summary(pane_pid).splitlines()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        rows = [f"Unable to read threads: {exc}"]
+    screen.keypad(True)
+    offset = 0
+    while True:
+        height, width = screen.getmaxyx()
+        offset = min(offset, max(0, len(rows) - height))
+        screen.erase()
+        for y, line in enumerate(rows[offset:offset + height]):
+            if width > 1:
+                screen.addnstr(y, 0, line, width - 1)
+        screen.refresh()
+        key = screen.getch()
+        if key in (ord("q"), ord("Q"), 27):
+            return
+        if key in (curses.KEY_DOWN, curses.KEY_NPAGE):
+            offset += height if key == curses.KEY_NPAGE else 1
+        if key in (curses.KEY_UP, curses.KEY_PPAGE):
+            offset = max(0, offset - (height if key == curses.KEY_PPAGE else 1))
+
+
+def bind_threads():
+    command = shlex.quote(SELF) + " --hud-popup"
+    popup = ["display-popup", "-E", "-w", "90%", "-h", "60%",
+             "-T", "Threads · q to close", command]
+    for table, key in [("prefix", "H"), ("root", "MouseDown1StatusRight")]:
+        existing = subprocess.run(["tmux", "list-keys", "-T", table, key], capture_output=True)
+        if existing.stdout.strip() and not any(flag in existing.stdout for flag in (b" --hud-threads ", b" --hud-popup")):
+            continue
+        if table == "root":
+            action = ["if-shell", "-F", "#{@oai_threads}", shlex.join(popup)]
+        else:
+            action = popup
+        subprocess.run(["tmux", "bind-key", "-T", table, key, *action], check=True)
+
+
+
 def main(args):
+    if args[:1] == ["--hud-popup"]:
+        import curses
+        pane = os.environ.get("TMUX_PANE")
+        target = ["-t", pane] if pane else []
+        pid = subprocess.check_output(["tmux", "display-message", "-p", *target, "#{pane_pid}"], text=True).strip()
+        curses.wrapper(show_threads, pid)
+        return
+    if args[:1] == ["--hud-threads"]:
+        print(thread_summary(args[1]))
+        return
     if args[:1] == ["--hud-meter"]:
         result = subprocess.run([sys.executable, APP, "status", "--view", args[1]],
                                 capture_output=True, text=True)
@@ -131,10 +230,11 @@ def main(args):
         print(f"{speed} │ Cache hit: latest {hit_rate(last)} · session {session}")
         return
     if args[:1] == ["--hud-pane"]:
-        footer = "#(" + shlex.quote(SELF) + " --hud-meter tmux-#{pane_id} #{pane_pid}) "
-        for key, value in [("set-titles-string", "#{pane_title}"), ("set-titles", "on"),
+        bind_threads()
+        footer = "#[bold,fg=colour117][Threads]#[default] #(" + shlex.quote(SELF) + " --hud-meter tmux-#{pane_id} #{pane_pid}) "
+        for key, value in [("@oai_threads", "1"), ("set-titles-string", "#{pane_title}"), ("set-titles", "on"),
                            ("mouse", "on"), ("status-right", footer), ("status-interval", "2"),
-                           ("status-right-length", "150"), ("status-style", "bg=colour235,fg=colour252")]:
+                           ("status-right-length", "165"), ("status-style", "bg=colour235,fg=colour252")]:
             subprocess.run(["tmux", "set-option", "-t", os.environ["TMUX_PANE"], key, value], check=True)
         os.execv(sys.executable, [sys.executable, str(APP), "run", "--", *args[1:]])
     if not APP.is_file():
