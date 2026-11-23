@@ -1,5 +1,7 @@
 # codex-tmux-hud
 
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md)
+
 Launch Codex CLI with a per-pane tmux footer on macOS, Linux and Windows via WSL2.
 
 ```text
