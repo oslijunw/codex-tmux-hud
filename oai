@@ -3,15 +3,22 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
-from pathlib import Path
 
 APP = Path(os.environ.get("OAI_COLLECTOR_APP", Path(__file__).resolve().parent / "collector/app.py")).expanduser()
 SELF = str(Path(__file__).resolve())
+CODEX_DIR = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").resolve()
+CONTROL_SOCKET = CODEX_DIR / "app-server-control/app-server-control.sock"
+TITLE_ITEMS = 'tui.terminal_title=["activity","thread-name","project-name","thread-id"]'
+THREAD_PREFIX = re.compile(r"\b([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{5,12})(?:\.{3})?$")
+LOCAL_REMOTE = f"unix://{CONTROL_SOCKET}"
+THREAD_ID = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
 
 
 def ensure_receiver():
@@ -87,6 +94,45 @@ def pane_paths(pane_pid):
     return paths
 
 
+def shared_thread(pane, include_children=False):
+    if not pane:
+        return None
+    title = subprocess.check_output(["tmux", "display-message", "-p", "-t", pane, "#{pane_title}"],
+                                    text=True).strip()
+    match = THREAD_PREFIX.search(title)
+    if not match:
+        return None
+    prefix = match.group(1)
+    try:
+        with sqlite3.connect((CODEX_DIR / "state_5.sqlite").as_uri() + "?mode=ro",
+                             uri=True, timeout=0.2) as db:
+            roots = db.execute(
+                "SELECT id, model, rollout_path FROM threads WHERE id >= ? AND id < ? LIMIT 2",
+                (prefix, prefix + "g"),
+            ).fetchall()
+            if len(roots) != 1:
+                return None
+            thread_id, model, rollout = roots[0]
+            paths = [Path(rollout)]
+            if include_children:
+                rows = db.execute(
+                    """WITH RECURSIVE descendants(id) AS (
+                           SELECT ?
+                           UNION
+                           SELECT edge.child_thread_id FROM thread_spawn_edges edge
+                           JOIN descendants ON edge.parent_thread_id = descendants.id
+                           WHERE edge.status = 'open'
+                       )
+                       SELECT rollout_path FROM threads JOIN descendants ON threads.id = descendants.id
+                       WHERE threads.id != ?""",
+                    (thread_id, thread_id),
+                )
+                paths.extend(Path(row[0]) for row in rows)
+            return model, paths
+    except sqlite3.Error:
+        return None
+
+
 def metadata(path):
     with path.open("rb") as stream:
         record = json.loads(stream.readline())
@@ -133,9 +179,10 @@ def read_usage(path):
     return {}
 
 
-def thread_summary(pane_pid):
+def thread_summary(pane_pid, pane=None):
+    shared = shared_thread(pane, include_children=True)
     rows = []
-    for path in pane_paths(pane_pid):
+    for path in shared[1] if shared else pane_paths(pane_pid):
         try:
             meta = metadata(path)
             usage = read_usage(path)
@@ -158,10 +205,10 @@ def thread_summary(pane_pid):
     return "\n".join(lines) if rows else "Waiting for thread data"
 
 
-def show_threads(screen, pane_pid):
+def show_threads(screen, pane_pid, pane):
     import curses
     try:
-        rows = thread_summary(pane_pid).splitlines()
+        rows = thread_summary(pane_pid, pane).splitlines()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         rows = [f"Unable to read threads: {exc}"]
     screen.keypad(True)
@@ -199,22 +246,86 @@ def bind_threads():
 
 
 
+def exit_summary(screen, returncode):
+    messages = []
+    for line in screen.splitlines():
+        text = line.strip()
+        resume = re.fullmatch(r"codex (?:(--remote [^ ]+) )?resume (" + THREAD_ID + ")", text)
+        if resume:
+            local_option = f"--remote {LOCAL_REMOTE}"
+            if resume.group(1) in (None, local_option):
+                messages.append(f"  oai resume {resume.group(2)}")
+            else:
+                messages.append(f"  {text}")
+        elif text.startswith((
+            "Disconnected from this task.",
+            "To reconnect, run:",
+            "To continue this session, run:",
+            "Stop the current turn:",
+            "Token usage:",
+            "Token usage so far:",
+            "Session ID:",
+        )) or (returncode and text.startswith("ERROR: ")):
+            if text.startswith("Stop the current turn:"):
+                text = text.replace(f"codex --remote {LOCAL_REMOTE} agents,", "codex agents,")
+            messages.append(text)
+    return "\n".join(messages)
+
+
+def replay_exit(pane, client_pid, returncode):
+    # A terminal title update marks the point after all Codex output reached tmux.
+    marker = f"oai-exit-{os.getpid()}"
+    print(f"\033]2;{marker}\007", end="", flush=True)
+    for _ in range(12):
+        client_info = subprocess.check_output(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_title}\t#{session_id}"],
+            text=True,
+        ).rstrip("\n").split("\t", 1)
+        if len(client_info) == 2 and client_info[0] == marker:
+            break
+        time.sleep(0.02)
+    screen = subprocess.check_output(
+        ["tmux", "capture-pane", "-pJ", "-t", pane, "-S", "-20"], text=True,
+    )
+    summary = exit_summary(screen, returncode)
+    clients = subprocess.check_output(
+        ["tmux", "list-clients", "-t", client_info[1], "-F", "#{client_pid}\t#{client_name}"],
+        text=True,
+    )
+    for line in clients.splitlines():
+        pid, name = line.split("\t", 1)
+        if pid == client_pid:
+            command = shlex.join([SELF, "--hud-exit", str(returncode), summary])
+            subprocess.run(["tmux", "detach-client", "-t", name, "-E", command], check=True)
+            break
+
+
 def main(args):
+    if args[:1] == ["--hud-exit"]:
+        if args[2]:
+            print(args[2])
+        return int(args[1])
     if args[:1] == ["--hud-popup"]:
         import curses
         pane = os.environ.get("TMUX_PANE")
         target = ["-t", pane] if pane else []
         pid = subprocess.check_output(["tmux", "display-message", "-p", *target, "#{pane_pid}"], text=True).strip()
-        curses.wrapper(show_threads, pid)
+        curses.wrapper(show_threads, pid, pane)
         return
     if args[:1] == ["--hud-threads"]:
-        print(thread_summary(args[1]))
+        print(thread_summary(args[1], args[2] if len(args) > 2 else None))
         return
     if args[:1] == ["--hud-meter"]:
-        result = subprocess.run([sys.executable, APP, "status", "--view", args[1]],
+        pane = args[1].removeprefix("tmux-") if args[1].startswith("tmux-%") else None
+        try:
+            shared = shared_thread(pane)
+        except (OSError, subprocess.SubprocessError):
+            shared = None
+        filter_args = ["--model", shared[0]] if shared and shared[0] else ["--view", args[1]]
+        result = subprocess.run([sys.executable, APP, "status", *filter_args],
                                 capture_output=True, text=True)
         try:
-            info = pane_usage(args[2])
+            info = read_usage(shared[1][0]) if shared else pane_usage(args[2])
         except (OSError, subprocess.SubprocessError):
             info = {}
         last = info.get("last_token_usage") or {}
@@ -229,14 +340,36 @@ def main(args):
         session = hit_rate(info.get("total_token_usage") or {})
         print(f"{speed} │ Cache hit: latest {hit_rate(last)} · session {session}")
         return
-    if args[:1] == ["--hud-pane"]:
+    if args and args[0] in ("--hud-pane", "--hud-resume-pane"):
+        client_pid = args[1] if args[0] == "--hud-resume-pane" else None
+        cli_args = args[2:] if client_pid else args[1:]
+        shared_resume = (
+            cli_args[:1] == ["resume"]
+            and CONTROL_SOCKET.is_socket()
+            and not any(arg in ("--no-daemon", "--remote") or arg.startswith("--remote=")
+                        for arg in cli_args[1:])
+        )
+        pane = os.environ["TMUX_PANE"]
+        title = "#{s/ [|] [0-9a-f-]+[.]*$//:pane_title}" if shared_resume else "#{pane_title}"
         bind_threads()
         footer = "#[bold,fg=colour117][Threads]#[default] #(" + shlex.quote(SELF) + " --hud-meter tmux-#{pane_id} #{pane_pid}) "
-        for key, value in [("@oai_threads", "1"), ("set-titles-string", "#{pane_title}"), ("set-titles", "on"),
+        for key, value in [("@oai_threads", "1"), ("set-titles-string", title), ("set-titles", "on"),
                            ("mouse", "on"), ("status-right", footer), ("status-interval", "2"),
                            ("status-right-length", "165"), ("status-style", "bg=colour235,fg=colour252")]:
-            subprocess.run(["tmux", "set-option", "-t", os.environ["TMUX_PANE"], key, value], check=True)
-        os.execv(sys.executable, [sys.executable, str(APP), "run", "--", *args[1:]])
+            subprocess.run(["tmux", "set-option", "-t", pane, key, value], check=True)
+        if shared_resume:
+            codex_args = ["codex", "--remote", LOCAL_REMOTE, "-c", TITLE_ITEMS, *cli_args]
+        else:
+            codex_args = [sys.executable, str(APP), "run", "--", *cli_args]
+        if not client_pid:
+            os.execvp(codex_args[0], codex_args)
+        result = subprocess.run(codex_args)
+        returncode = result.returncode if result.returncode >= 0 else 128 - result.returncode
+        try:
+            replay_exit(pane, client_pid, returncode)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        return returncode
     if not APP.is_file():
         sys.exit(f"Missing CodexTPS entry point: {APP}")
     ensure_receiver()
@@ -245,8 +378,10 @@ def main(args):
     if os.environ.get("TMUX"):
         session = subprocess.check_output(command + ["-dP", "-F", "#{session_id}", *pane], text=True).strip()
         os.execlp("tmux", "tmux", "switch-client", "-t", session)
+    if args[:1] == ["resume"] and sys.stdin.isatty() and sys.stdout.isatty():
+        pane = [SELF, "--hud-resume-pane", str(os.getpid()), *args]
     os.execvp("tmux", command + pane)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]))

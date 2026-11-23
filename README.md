@@ -38,11 +38,21 @@ Context shows the last reported request size and the model context window. Cache
 
 Click **[Threads]** in the footer to inspect context usage and cache hit rates for the main thread and its open subagents. Press **q** or **Esc** to close the popup. The footer shows main-thread usage when several rollout files are open.
 
-Each launch creates a tmux session with mouse scrolling. Detaching leaves Codex running. Reattach with `tmux attach -t SESSION` to return to it.
+Each launch creates a tmux session with mouse scrolling. When a local Codex background server is available, `oai resume` uses it so the same conversation can stay open in two windows. On exit from a normal shell, the launcher displays Codex's exit summary and an `oai resume` command for that conversation. Detaching leaves Codex running. Reattach with `tmux attach -t SESSION` to return to it.
 
 ## Collector
 
-The bundled MIT-licensed CodexTPS receiver runs on loopback. The launcher reuses a running receiver or starts one in the background. By default it listens on port 4319 and stores metrics under `~/Library/Application Support/CodexTPS/data` on macOS and `~/.local/share/codex-tps` on Linux. Existing CodexTPS port settings are honored. To use a compatible CodexTPS checkout, set `OAI_COLLECTOR_APP` to its absolute app.py path. The launcher passes telemetry settings to each Codex invocation.
+The bundled MIT-licensed CodexTPS receiver runs on loopback. The launcher reuses a running receiver or starts one in the background. By default it listens on port 4319 and stores metrics under `~/Library/Application Support/CodexTPS/data` on macOS and `~/.local/share/codex-tps` on Linux. Existing CodexTPS port settings are honored. To use a compatible CodexTPS checkout, set `OAI_COLLECTOR_APP` to its absolute app.py path. The launcher passes telemetry settings to standalone Codex invocations. A shared Codex server uses its own telemetry settings. If TPS is missing when resuming a shared session, set the following exporters in the Codex user config, using the receiver's configured port. Restart the Codex background server once its work has finished so it picks up the new settings.
+
+```toml
+[otel.exporter.otlp-http]
+endpoint = "http://127.0.0.1:4319/v1/logs"
+protocol = "json"
+
+[otel.trace_exporter.otlp-http]
+endpoint = "http://127.0.0.1:4319/v1/traces"
+protocol = "json"
+```
 
 ## License
 
